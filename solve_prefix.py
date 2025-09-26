@@ -6,6 +6,7 @@ import itertools
 import multiprocessing as mp
 from base64 import b64encode
 from collections import Counter
+import argparse
 from typing import List, Tuple
 
 
@@ -47,8 +48,9 @@ def can_use_supply(prefix: str, cols: List[int], columns: List[List[str]]) -> bo
     return all(all(need[c][ch] <= have[c][ch] for ch in need[c]) for c in range(len(columns)))
 
 
-def backtrack_search(cols: List[int], columns: List[List[str]], target_b64: str, seed_greedy: bool = True) -> str | None:
+def backtrack_search(cols: List[int], columns: List[List[str]], target_b64: str, seed_greedy: bool = True, fixed: dict[int,str] | None = None) -> str | None:
     supplies = [Counter(col) for col in columns]
+    fixed = fixed or {}
 
     # Greedy candidate (top-of-bag order) as a quick check
     if seed_greedy:
@@ -65,10 +67,17 @@ def backtrack_search(cols: List[int], columns: List[List[str]], target_b64: str,
             if sha256_b64(s) == target_b64:
                 return s
 
-    # Order choices at each position by frequency (rarer letters first)
+    # Order choices at each position by frequency (rarer letters first), and apply fixed-letter constraints
     per_pos_choices: List[List[str]] = []
     for i, c in enumerate(cols):
-        choices = sorted(set(columns[c]), key=lambda ch: (supplies[c][ch], ch))
+        if i in fixed:
+            ch = fixed[i]
+            # If the fixed letter is not in this column's bag, this is impossible
+            if supplies[c][ch] <= 0:
+                return None
+            choices = [ch]
+        else:
+            choices = sorted(set(columns[c]), key=lambda ch: (supplies[c][ch], ch))
         per_pos_choices.append(choices)
 
     target_len = len(cols)
@@ -100,13 +109,20 @@ def backtrack_search(cols: List[int], columns: List[List[str]], target_b64: str,
     return dfs(0)
 
 
-def parallel_search(cols: List[int], columns: List[List[str]], target_b64: str, fanout: int = 2000) -> str | None:
+def parallel_search(cols: List[int], columns: List[List[str]], target_b64: str, fanout: int = 2000, split_depth: int = 6, processes: int | None = None, fixed: dict[int,str] | None = None) -> str | None:
     # Split on first K positions to generate partial prefixes, then search each shard in parallel
-    K = 6  # modest split; adjust as resources allow
+    K = split_depth
     supplies = [Counter(col) for col in columns]
+    fixed = fixed or {}
     per_pos_choices: List[List[str]] = []
     for i, c in enumerate(cols[:K]):
-        choices = sorted(set(columns[c]), key=lambda ch: (supplies[c][ch], ch))
+        if i in fixed:
+            ch = fixed[i]
+            if supplies[c][ch] <= 0:
+                return None
+            choices = [ch]
+        else:
+            choices = sorted(set(columns[c]), key=lambda ch: (supplies[c][ch], ch))
         per_pos_choices.append(choices)
 
     # Generate a limited number of partials (bounded by fanout)
@@ -146,7 +162,11 @@ def parallel_search(cols: List[int], columns: List[List[str]], target_b64: str, 
                 return None
             c = cols[pos]
             # Use deterministic order
-            choices = sorted({ch for ch in columns[c] if sup[c][ch] > 0})
+            if pos in fixed:
+                ch = fixed[pos]
+                choices = [ch] if sup[c][ch] > 0 else []
+            else:
+                choices = sorted({ch for ch in columns[c] if sup[c][ch] > 0})
             for ch in choices:
                 if sup[c][ch] <= 0:
                     continue
@@ -160,7 +180,7 @@ def parallel_search(cols: List[int], columns: List[List[str]], target_b64: str, 
             return None
         return dfs(start)
 
-    with mp.Pool(processes=max(1, mp.cpu_count() - 1)) as pool:
+    with mp.Pool(processes=processes or max(1, mp.cpu_count() - 1)) as pool:
         for res in pool.imap_unordered(worker, partials, chunksize=1):
             if res:
                 pool.terminate()
@@ -169,7 +189,16 @@ def parallel_search(cols: List[int], columns: List[List[str]], target_b64: str, 
 
 
 def main() -> None:
-    target_b64 = 'f2wY/HdX9INIR1BoLQV4Xp0HMMhUn8XZLYxlAfm1vRw='
+    parser = argparse.ArgumentParser(description="Find 35-char prefix matching the hidden checksum using column supplies.")
+    parser.add_argument("--target", default='f2wY/HdX9INIR1BoLQV4Xp0HMMhUn8XZLYxlAfm1vRw=', help="Target SHA-256 base64 of the 35-char prefix")
+    parser.add_argument("--split-depth", type=int, default=8, help="Parallel split depth (first K positions)")
+    parser.add_argument("--fanout", type=int, default=20000, help="Limit of partials generated for parallel search")
+    parser.add_argument("--processes", type=int, default=0, help="Number of worker processes (0 => cpu_count-1)")
+    parser.add_argument("--no-greedy", action="store_true", help="Disable greedy seed check")
+    parser.add_argument("--no-fixed", action="store_true", help="Disable fixed-letter constraints from h()")
+    args = parser.parse_args()
+
+    target_b64 = args.target
     cols = first35_columns(QUOTE, WIDTH)
 
     # Quick feasibility: ensure we even have enough letters per column for the first 35
@@ -178,10 +207,23 @@ def main() -> None:
     if any(need_counts[i] > have_counts[i] for i in need_counts):
         raise SystemExit(f"Not enough supply per column for first 35: need {need_counts}, have {have_counts}")
 
+    # Apply fixed-letter constraints from the game's h() check that fall within the first 35
+    h_indices = [7, 11, 15, 16, 20, 23, 31, 37, 47, 56, 70, 71, 80, 90, 104, 113]
+    h_string = "SKATEBOARDCANINE"
+    fixed = {} if args.no_fixed else {i: ch for i, ch in zip(h_indices, h_string) if i < 35}
+
     # Try greedy and then backtracking
-    sol = backtrack_search(cols, COLUMNS, target_b64, seed_greedy=True)
+    sol = backtrack_search(cols, COLUMNS, target_b64, seed_greedy=not args.no_greedy, fixed=fixed)
     if sol is None:
-        sol = parallel_search(cols, COLUMNS, target_b64, fanout=4000)
+        sol = parallel_search(
+            cols,
+            COLUMNS,
+            target_b64,
+            fanout=args.fanout,
+            split_depth=args.split_depth,
+            processes=(args.processes or None),
+            fixed=fixed,
+        )
 
     if sol:
         print("Found prefix:", sol)
